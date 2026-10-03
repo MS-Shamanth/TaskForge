@@ -80,7 +80,8 @@ RETURNING *;
 - `FOR UPDATE` locks the selected rows. `SKIP LOCKED` makes a concurrent claimer skip rows another transaction has already locked, instead of waiting for them. So workers never block each other and two workers can never lock the same row.
 - Selection and update are one autocommit statement, so there is no gap between "pick" and "mark RUNNING". Under READ COMMITTED, a row that another worker has already committed as `RUNNING` is re-checked against the `WHERE` clause and dropped.
 - The claim sets the lease (`locked_until`) using the database clock and counts the attempt immediately.
-- `idx_jobs_ready (status, priority DESC, run_at)` supports the inner query.
+- The partial index `idx_jobs_claim ON jobs (priority DESC, run_at) WHERE status IN ('QUEUED','RETRY')` (migration `V2`) holds only claimable jobs, already in claim order. On a seeded table of 5,000 jobs, 650 of which were due (`QUEUED` or `RETRY` with a past `run_at`), `EXPLAIN ANALYZE` of the inner query with `LIMIT 8` showed an index scan on it, with `run_at <= now()` as the index condition and no sort step. It read 8 rows and stopped.
+- With only `idx_jobs_ready (status, priority DESC, run_at)` from `V1`, the same query fetched all 650 due rows and sorted them before the `LIMIT`, because an index that starts with `status` cannot return two statuses in `priority` order. `idx_jobs_ready` is kept, because the lease reaper and the count behind `GET /api/jobs?status=` use it.
 
 ## Reliability
 
@@ -206,7 +207,9 @@ curl http://localhost:8080/api/stats
 
 ## WebSocket feed
 
-STOMP endpoint `ws://localhost:8080/ws` (plain WebSocket, no SockJS), with a simple in-memory broker on `/topic`. Every status change is published to `/topic/jobs`: submit, claim, success, retry, dead, reaper, retry endpoint and cancel. Publishing preserves order per subscriber, so a job's `RUNNING` arrives before its `SUCCEEDED`.
+STOMP endpoint `ws://localhost:8080/ws` (plain WebSocket, no SockJS), with a simple in-memory broker on `/topic`. Clients can only subscribe; the server rejects client `SEND` and `MESSAGE` frames, the two frames that would publish to a topic (see Security notes). Every status change is published to `/topic/jobs`: submit, claim, success, retry, dead, reaper, retry endpoint and cancel.
+
+Event order. Each status event is published by the thread that made the change, after its statement committed: `QUEUED` and `CANCELLED` by the HTTP request thread, `RUNNING` by the poller, a job's `SUCCEEDED`, `RETRY` or `DEAD` by the worker thread that ran it, and lease expiries by the reaper. Publishing preserves order per subscriber, and the poller publishes `RUNNING` before it hands the job to a worker thread, so a job's `RUNNING` arrives before the result of that attempt. Events from different threads can arrive out of order, though. A worker can claim a new job and publish `RUNNING` before the HTTP thread has published `QUEUED`. The retry endpoint's `QUEUED` and the reaper's `RETRY` can race with the next claim in the same way. A subscriber that tracks job state should therefore keep, per job `id`, the event with the newest `timestamp`. That `timestamp` is the job row's `updated_at`, returned by the statement that made the change (`RETURNING *`). It comes from the PostgreSQL clock (`now()`, the start time of that statement's transaction), not from the JVM. The `timestamp` of a `/topic/notifications` message is the JVM time at which the handler sent it.
 
 | Topic | Message |
 |---|---|
@@ -247,6 +250,7 @@ These are raw STOMP 1.2 frames, each ending in a NUL byte. The same frames were 
 | `taskforge.reaper.interval` | `10s` | Reaper period |
 | `taskforge.report.dir` | `reports` | Output directory for CSV reports (git-ignored) |
 | `taskforge.webhook.connect-timeout` / `read-timeout` | `5s` / `10s` | Webhook HTTP timeouts |
+| `server.address` | `127.0.0.1` | Interface the HTTP and WebSocket server listens on. `0.0.0.0` means all interfaces; there is no authentication, so use it only on a trusted network |
 | `spring.datasource.url` | `jdbc:postgresql://localhost:5433/taskforge` | The compose database |
 | `spring.datasource.username` / `password` | `taskforge` / `taskforge` | Local development only |
 
@@ -268,7 +272,9 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 Notes:
 
-- The database is published on port 5433 because 5432 is often taken by a locally installed PostgreSQL.
+- The database is published on `127.0.0.1:5433` only. It uses port 5433 because 5432 is often taken by a locally installed PostgreSQL.
+- The app listens on `127.0.0.1:8080` only, because it has no authentication. To accept connections from other machines, pass `--server.address=0.0.0.0`, for example `.\mvnw.cmd spring-boot:run "-Dspring-boot.run.arguments=--server.address=0.0.0.0"`. Anyone who can reach the port can then submit, cancel and retry jobs, so do this only on a trusted network.
+- In Windows PowerShell 5.1, the first request to `http://localhost:8080` can pause for about 2 s. `localhost` resolves to `::1` first, the app does not listen there, and PowerShell tries `127.0.0.1` only after the IPv6 attempt fails. Use `http://127.0.0.1:8080` to avoid the pause.
 - The app sets the JVM time zone to UTC at startup. PgJDBC sends the JVM time zone to the server, and current PostgreSQL images reject legacy zone IDs such as `Asia/Calcutta`.
 - Flyway creates the `jobs` table on first start.
 - To stop, press `Ctrl+C`, then run `docker compose down` (add `-v` to delete the data volume).
@@ -293,21 +299,22 @@ Docker must be running. The suite uses JUnit 6 (Jupiter), Testcontainers, Assert
 | 8 | An expired lease is requeued by the reaper and finished by another worker; on the last attempt it goes `DEAD` | `LeaseRecoveryTest` |
 | 9 | A stale worker's completion is rejected, including the same worker's earlier claim | `FencingTest` |
 | 10 | 4 workers × 8 threads (32 threads) process 5,000 jobs; each runs exactly once and ends `SUCCEEDED` | `ConcurrencyTest` |
-| 11 | A STOMP client on `/topic/jobs` receives `QUEUED`, `RUNNING` and `SUCCEEDED` (`RUNNING` first), plus the notification | `JobStatusWebSocketTest` |
+| 11 | A STOMP client on `/topic/jobs` receives `QUEUED`, `RUNNING` and `SUCCEEDED` (`RUNNING` before `SUCCEEDED`), plus the notification | `JobStatusWebSocketTest.stompSubscriberReceivesStatusChangesAndNotifications` |
 | 12 | The API returns `201`, `200` replay, `400`, `404` and `409`, and handles paging and stats | `JobApiTest` |
 | | SKIP LOCKED skips a row locked by another transaction without blocking | `ClaimQueryTest.skipsRowsLockedByAnotherTransaction` |
+| | A forged event that a client sends to `/topic/jobs` as a raw `SEND` or `MESSAGE` frame gets an `ERROR` frame and a closed connection and never reaches a subscriber, while server events still do | `JobStatusWebSocketTest.clientCannotPublishToTopics` |
 | | The webhook POSTs the JSON body and `Idempotency-Key`; a `500` is retried, then dead-lettered | `WebhookJobHandlerTest` |
 | | CSV escaping, overwrite on rerun, and rejection of unsafe report names | `ReportJobHandlerTest` |
 
-Results on 2026-10-02 (Windows 11, 16 logical CPUs, Docker Desktop 29.3.1, JDK 25.0.2):
+Results on 2026-10-03 (Windows 11, 16 logical CPUs, Docker Desktop 29.3.1, JDK 25.0.2):
 
-- The final run of `.\mvnw.cmd test` had 43 tests: 0 failures, 0 errors, 1 skipped (the opt-in benchmark below), `BUILD SUCCESS`, total time 43.1 s. The concurrency test printed:
+- The latest run of `.\mvnw.cmd test` had 45 tests: 0 failures, 0 errors, 1 skipped (the opt-in benchmark below), `BUILD SUCCESS`, total time 17.5 s. The concurrency test printed:
 
   ```
-  CONCURRENCY jobs=5000 workers=4 threadsPerWorker=8 totalThreads=32 elapsedMs=5743 jobsPerSec=871 executions[min=1,max=1,total=5000] duplicates=0 perWorker={worker-0=1151, worker-1=1209, worker-2=1231, worker-3=1409} distinctThreads=32
+  CONCURRENCY jobs=5000 workers=4 threadsPerWorker=8 totalThreads=32 elapsedMs=1030 jobsPerSec=4854 executions[min=1,max=1,total=5000] duplicates=0 perWorker={worker-0=1340, worker-1=1247, worker-2=1270, worker-3=1143} distinctThreads=32
   ```
 
-- Two earlier full runs had 40 tests each, before the benchmark class and two API tests were added. Both had 0 failures and took 16.3 s in total. In those runs the 5,000 jobs took 927 ms and 928 ms (about 5,400 jobs/s), also with `duplicates=0` and `distinctThreads=32`.
+- Earlier full runs on 2026-10-02 and 2026-10-03 (40 to 45 tests as the suite grew) all had 0 failures, `duplicates=0` and `distinctThreads=32`.
 
 In every run, every job ran exactly once (min = max = 1 execution, 0 duplicates), all 5,000 ended `SUCCEEDED` with `attempts = 1`, and all 32 worker threads did work. Wall-clock times varied a lot between runs on the same machine (0.9 s to 6.2 s for the 5,000 jobs, 16 s to 1 min 44 s for the whole build), so treat them as indicative only.
 
@@ -343,11 +350,12 @@ A second pool roughly doubles throughput, because pools claim independently thro
 
 ## Security notes
 
-- There is no authentication or authorization. TaskForge is a local demo, so do not expose it.
+- There is no authentication or authorization. TaskForge is a local demo, so by default it binds to `127.0.0.1` (`server.address` in `application.properties`) and only accepts connections from the same machine. With `--server.address=0.0.0.0` it listens on all interfaces, and anyone who can reach port 8080 can submit, cancel and retry jobs. Do not expose it to an untrusted network. The loopback binding does not stop pages open in your own browser: a DNS-rebinding page, or a cross-site form POST to `/api/jobs/{id}/retry` (which takes no body), can still reach the API.
 - Webhook URLs are not allow-listed. Anyone who can submit jobs can make the server POST to any host, including internal addresses (SSRF). Add an allow-list before exposing it.
 - Report names are restricted to `[A-Za-z0-9_-]{1,64}`, so a payload cannot write outside the reports directory.
 - The WebSocket endpoint relies on Spring's default same-origin check for browsers and has no authentication.
-- The credentials in `compose.yaml` and `application.properties` are for local development only.
+- WebSocket clients can only subscribe. The simple broker relays every client message of type `MESSAGE` to all subscribers of its destination, and a client can send one as a `SEND` frame or as a `MESSAGE` frame (normally a server-only frame). An interceptor on the client inbound channel (`WebSocketConfig`) therefore rejects every client message of that type: the client gets an `ERROR` frame and its connection is closed. Without it, a client could push a forged event on `/topic/jobs` or `/topic/notifications` to every subscriber. The server publishes through `SimpMessagingTemplate`, which does not pass through that channel.
+- `compose.yaml` publishes PostgreSQL on `127.0.0.1:5433` only. Its credentials, and the ones in `application.properties`, are for local development only.
 
 ## Next steps
 
@@ -371,10 +379,10 @@ src/main/java/com/shamanth/taskforge
 └── worker/    Worker, WorkerPoller, JobExecutor, BackoffPolicy, LeaseReaper, WorkerFactory
 src/main/resources
 ├── application.properties
-└── db/migration/V1__create_jobs_table.sql
+└── db/migration/   V1__create_jobs_table.sql, V2__add_claim_index.sql
 src/test/java/com/shamanth/taskforge
 ├── AbstractIntegrationTest, AbstractManualWorkerTest, TestcontainersConfiguration
 ├── api/ handler/ job/ stream/ worker/   tests listed above
 └── support/   test-only FLAKY, ALWAYS_FAIL and COUNTING handlers
-compose.yaml                      PostgreSQL 16 on port 5433
+compose.yaml                      PostgreSQL 16 on 127.0.0.1:5433
 ```

@@ -109,8 +109,4 @@ public class Worker {
 		return threads;
 	}
 
-	public int inFlight() {
-		return inFlight.get();
-	}
-
 }
